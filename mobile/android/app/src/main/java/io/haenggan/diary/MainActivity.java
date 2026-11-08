@@ -49,11 +49,33 @@ public final class MainActivity extends Activity {
     }
     private void event(String name,JSONObject data){runOnUiThread(()->{if(web!=null)web.evaluateJavascript("window.nativeEvent("+JSONObject.quote(name)+","+data+")",null);});}
     private void browser(String url){runOnUiThread(()->{try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url)));}catch(ActivityNotFoundException e){chat.cancelSignIn();event("error",message("기본 브라우저를 설치한 뒤 다시 연결해 주세요."));}});}
+    private void loginBrowser(String url,boolean chooseBrowser) {
+        runOnUiThread(()->{
+            if(!chat.isSignInPending() || isFinishing() || isDestroyed())return;
+            ResultReceiver ready=new ResultReceiver(new Handler(Looper.getMainLooper())) {
+                @Override protected void onReceiveResult(int code,Bundle data) {
+                    if(code==LoginService.EXPIRED){chat.cancelSignIn("연결 시간이 지났어요. 행간에서 다시 연결해 주세요. [HG-SESSION-TIMEOUT]");return;}
+                    if(code!=LoginService.READY || !chat.isSignInPending())return;
+                    try {
+                        Intent browser=new Intent(Intent.ACTION_VIEW,Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE);
+                        startActivity(chooseBrowser?Intent.createChooser(browser,"연결에 사용할 브라우저"):browser);
+                    }
+                    catch(ActivityNotFoundException e){chat.cancelSignIn("기본 브라우저를 설치한 뒤 다시 연결해 주세요. [HG-BROWSER]");}
+                }
+            };
+            try {startForegroundService(new Intent(this,LoginService.class).putExtra(LoginService.RECEIVER,ready));}
+            catch(RuntimeException e){chat.cancelSignIn("로그인 대기를 시작하지 못했어요. 행간 화면에서 다시 눌러 주세요. [HG-SERVICE]");}
+        });
+    }
+    private JSONObject connectAccount(String account,boolean chooseBrowser) throws Exception {
+        try {return chat.signIn(account,url->loginBrowser(url,chooseBrowser),text->event("loginProgress",message(text)));}
+        finally {runOnUiThread(()->stopService(new Intent(this,LoginService.class)));}
+    }
     private static JSONObject message(String text){try{return new JSONObject().put("text",text);}catch(Exception e){return new JSONObject();}}
     private JSONObject state() throws Exception {
         JSONObject s=diary.state();NotificationManager n=getSystemService(NotificationManager.class);AlarmManager a=getSystemService(AlarmManager.class);
         boolean enabled=ReminderReceiver.prefs(this).getBoolean("enabled",false),granted=n.areNotificationsEnabled();
-        s.put("reminders",enabled&&granted).put("reminderRequested",enabled).put("exactAlarm",Build.VERSION.SDK_INT<31||a.canScheduleExactAlarms()).put("onDeviceSpeech",Build.VERSION.SDK_INT>=31&&SpeechRecognizer.isOnDeviceRecognitionAvailable(this));
+        s.put("reminders",enabled&&granted).put("reminderRequested",enabled).put("exactAlarm",Build.VERSION.SDK_INT<31||a.canScheduleExactAlarms()).put("onDeviceSpeech",Build.VERSION.SDK_INT>=31&&SpeechRecognizer.isOnDeviceRecognitionAvailable(this)).put("loginRetryAccount",chat.retryAccount());
         JSONArray entries=s.getJSONArray("entries");boolean hasToday=false;for(int i=0;i<entries.length();i++)hasToday|=DiaryStore.today().equals(entries.getJSONObject(i).optString("date"));
         ReminderReceiver.prefs(this).edit().putString("lastSavedDay",hasToday?DiaryStore.today():"").apply();return s;
     }
@@ -86,7 +108,7 @@ public final class MainActivity extends Activity {
                     case "summaryWeek" -> result=diary.summarizeWeek(input.getString("start"));
                     case "intention" -> {diary.intention(input.getString("start"),input.getString("text"));result=true;}
                     case "question" -> {String text=input.getString("text");if(text.length()<10||text.length()>16000)throw new IllegalArgumentException("일기를 조금 더 남긴 뒤 질문을 받아보세요.");result=chat.complete(DiaryStore.EDITOR+"사용자가 언급한 사건이나 감정에서 질문 딱 하나를 60자 이내로 반환하라. 조언이나 추측은 하지 마라.",text);}
-                    case "connect" -> result=chat.signIn(input.optString("id"),MainActivity.this::browser);
+                    case "connect" -> result=connectAccount(input.optString("id"),input.optBoolean("chooseBrowser"));
                     case "selectAccount" -> {diary.select(input.getString("id"));result=state();}
                     case "disconnect" -> result=new JSONObject().put("revoked",chat.signOut(input.getString("id")));
                     case "welcome" -> {diary.accountSetting("welcomed","");result=true;}

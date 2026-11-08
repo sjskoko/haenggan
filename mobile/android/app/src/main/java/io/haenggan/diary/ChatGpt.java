@@ -1,6 +1,5 @@
 package io.haenggan.diary;
 
-import android.net.Uri;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -12,7 +11,12 @@ import org.json.*;
 final class ChatGpt {
     static final String RESOURCE="https://api.openai.com/v1";
     private final Vault vault;
-    private volatile ServerSocket callback;
+    private volatile LoopbackCallback callback;
+    private volatile boolean signInCancelled;
+    private volatile String cancelReason="계정 연결을 취소했어요.";
+    private volatile HttpURLConnection tokenConnection;
+    private volatile String retryAccount="";
+    interface Progress { void update(String message); }
     interface OpenBrowser { void open(String url); }
     ChatGpt(Vault vault) { this.vault=vault; }
     static String random() { byte[] bytes=new byte[32];new SecureRandom().nextBytes(bytes);return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes); }
@@ -53,56 +57,81 @@ final class ChatGpt {
         JSONObject keys=jsonRequest(Oidc.ISSUER+"/.well-known/jwks.json","GET",null,null,null);
         return Oidc.verify(token.getString("id_token"),keys,client,nonce,priorSubject,System.currentTimeMillis()/1000);
     }
-    synchronized JSONObject signIn(String selected,OpenBrowser browser) throws Exception {
+    synchronized JSONObject signIn(String selected,OpenBrowser browser,Progress progress) throws Exception {
+        signInCancelled=false;
+        retryAccount=selected;
+        String stage="WAIT";
         JSONObject root=vault.read(), accounts=root.optJSONObject("accounts"); if(accounts==null)accounts=new JSONObject();
         JSONObject prior=accounts.optJSONObject(selected); String client=prior==null?"dynamic_agent_client":prior.getString("clientId");
         String host=root.optString("hostId");if(host.isEmpty()){host="urn:uuid:"+UUID.randomUUID();root.put("hostId",host);vault.write(root);}
         String state=random(),nonce=random(),verifier=random();
         String challenge=Base64.getUrlEncoder().withoutPadding().encodeToString(MessageDigest.getInstance("SHA-256").digest(verifier.getBytes(StandardCharsets.US_ASCII)));
-        try(ServerSocket server=new ServerSocket(0,8,InetAddress.getByName("127.0.0.1"))) {
-            callback=server;server.setSoTimeout(180000);
-            String redirect="http://127.0.0.1:"+server.getLocalPort()+"/auth/callback";
+        try(LoopbackCallback server=new LoopbackCallback()) {
+            callback=server;
+            String redirect=server.redirectUri();
             Map<String,String> params=new LinkedHashMap<>();
             params.put("client_id",client);params.put("ext_agent_host_id",host);
             if(prior==null)params.put("agent_name_hint","행간");
             else { if(!prior.optString("idToken").isEmpty())params.put("id_token_hint",prior.getString("idToken"));if(!prior.optString("email").isEmpty())params.put("login_hint",prior.getString("email")); }
             params.put("response_type","code");params.put("redirect_uri",redirect);params.put("scope","openid profile email offline_access resource.invoke chatgpt.tokens.use.direct");params.put("resource",RESOURCE);params.put("state",state);params.put("nonce",nonce);params.put("code_challenge_method","S256");params.put("code_challenge",challenge);
+            progress.update("브라우저의 승인 응답을 기다리고 있어요 · HG-WAIT");
             browser.open(Oidc.ISSUER+"/api/accounts/authorize?"+form(params));
-            long deadline=System.currentTimeMillis()+180000;
-            while(System.currentTimeMillis()<deadline) {
-                server.setSoTimeout((int)Math.max(1,deadline-System.currentTimeMillis()));
-                try(Socket socket=server.accept()) {
-                    socket.setSoTimeout(3000);
-                    BufferedReader reader=new BufferedReader(new InputStreamReader(socket.getInputStream(),StandardCharsets.US_ASCII));
-                    StringBuilder first=new StringBuilder();int next;while((next=reader.read())!=-1&&next!='\n'&&first.length()<16384)first.append((char)next);
-                    String[] line=first.toString().trim().split(" ");
-                    if(line.length!=3||!line[0].equals("GET")||first.length()>=16384){reply(socket,false);continue;}
-                    Uri uri=Uri.parse("http://127.0.0.1"+line[1]);
-                    if(!"/auth/callback".equals(uri.getPath())||!Oidc.constantTime(state,Objects.requireNonNullElse(uri.getQueryParameter("state"),""))){reply(socket,false);continue;}
-                    if(uri.getQueryParameter("error")!=null){reply(socket,true);throw new IOException("계정 연결을 취소했어요.");}
-                    String issued=uri.getQueryParameter("client_id");
-                    if(prior==null) {
-                        if(issued==null||!issued.matches("[A-Za-z0-9_-]{8,200}")||issued.equals("dynamic_agent_client"))throw new IOException("계정 등록을 마치지 못했어요.");
-                        client=issued; prior=new JSONObject().put("clientId",client).put("label","연결 재시도");
-                        root=vault.read();accounts=root.optJSONObject("accounts");if(accounts==null)accounts=new JSONObject();accounts.put(client,prior);root.put("accounts",accounts);vault.write(root);
-                    } else if(issued!=null&&!client.equals(issued))throw new SecurityException("다른 계정의 연결 요청이에요.");
-                    String code=uri.getQueryParameter("code");if(code==null||code.isBlank())throw new IOException("로그인 응답이 비어 있어요.");
-                    reply(socket,true);
-                    JSONObject token=jsonRequest(Oidc.ISSUER+"/api/accounts/oauth/token","POST",null,"application/x-www-form-urlencoded",form(Map.of("grant_type","authorization_code","client_id",client,"code",code,"code_verifier",verifier,"redirect_uri",redirect,"resource",RESOURCE)).getBytes(StandardCharsets.UTF_8));
-                    JSONObject identity=verifyTokens(token,client,nonce,prior.optString("subject").isEmpty()?null:prior.getString("subject"));
-                    JSONObject record=mergeTokens(prior,token,identity);
-                    root=vault.read();accounts=root.getJSONObject("accounts");accounts.put(client,record);root.put("activeAccount",client);vault.write(root);
-                    return publicAccount(record);
-                }
+            Map<String,String> result=server.await(state,150000);
+            ensureSignInActive();
+            stage="CONSENT";
+            if(result.containsKey("error")) {
+                String error=result.get("error");
+                if("access_denied".equals(error))throw new IOException("ChatGPT에서 연결이 승인되지 않았어요. 승인 화면의 안내를 확인해 주세요. [HG-CONSENT]");
+                throw new IOException("ChatGPT 승인 화면에서 오류가 반환됐어요. [HG-CONSENT / "+safeCode(error)+"]");
             }
-            throw new IOException("로그인 시간이 지났어요. 다시 연결해 주세요.");
-        } finally {callback=null;}
+            String issued=result.get("client_id");
+            if(prior==null) {
+                if(issued==null||!issued.matches("[A-Za-z0-9_-]{8,200}")||issued.equals("dynamic_agent_client"))throw new IOException("계정 등록 응답을 받지 못했어요. [HG-REGISTER]");
+                client=issued; prior=new JSONObject().put("clientId",client).put("label","연결 재시도");
+                retryAccount=issued;
+                root=vault.read();accounts=root.optJSONObject("accounts");if(accounts==null)accounts=new JSONObject();accounts.put(client,prior);root.put("accounts",accounts);vault.write(root);
+            } else if(issued!=null&&!client.equals(issued))throw new SecurityException("다른 계정의 연결 요청이에요. [HG-ACCOUNT]");
+            String code=result.get("code");if(code==null||code.isBlank())throw new IOException("로그인 응답이 비어 있어요. [HG-CODE]");
+            stage="TOKEN";
+            progress.update("승인 응답을 받았어요. 계정을 연결하고 있어요 · HG-TOKEN");
+            JSONObject token=signInRequest(Oidc.ISSUER+"/api/accounts/oauth/token",form(Map.of("grant_type","authorization_code","client_id",client,"code",code,"code_verifier",verifier,"redirect_uri",redirect,"resource",RESOURCE)).getBytes(StandardCharsets.UTF_8));
+            ensureSignInActive();
+            stage="VERIFY";
+            progress.update("계정의 서명을 확인하고 있어요 · HG-VERIFY");
+            if(!"Bearer".equalsIgnoreCase(token.optString("token_type")))throw new SecurityException("지원되지 않는 계정 연결이에요.");
+            JSONObject keys=signInRequest(Oidc.ISSUER+"/.well-known/jwks.json",null);
+            JSONObject identity=Oidc.verify(token.getString("id_token"),keys,client,nonce,prior.optString("subject").isEmpty()?null:prior.getString("subject"),System.currentTimeMillis()/1000);
+            ensureSignInActive();
+            JSONObject record=mergeTokens(prior,token,identity);
+            root=vault.read();accounts=root.getJSONObject("accounts");accounts.put(client,record);root.put("activeAccount",client);vault.write(root);
+            progress.update("연결을 확인했어요 · HG-DONE");
+            return publicAccount(record);
+        } catch(Exception error) {
+            if(signInCancelled)throw new IOException(cancelReason);
+            if(error instanceof SocketTimeoutException)throw new IOException(stage.equals("WAIT")?"승인 응답이 앱에 도착하지 않았어요. 연결을 다시 시작해 주세요. [HG-WAIT-TIMEOUT]":"ChatGPT 응답 시간이 초과됐어요. 다시 연결해 주세요. [HG-"+stage+"-TIMEOUT]");
+            String message=error.getMessage();
+            if(message!=null&&message.matches("(?s).*[가-힣].*"))throw new IOException(message+" [HG-"+stage+"]");
+            throw new IOException("계정 연결을 마치지 못했어요. 다시 시도해 주세요. [HG-"+stage+"-"+errorKind(error)+"]");
+        } finally {callback=null;tokenConnection=null;}
     }
-    void cancelSignIn(){ServerSocket s=callback;if(s!=null)try{s.close();}catch(IOException ignored){} }
-    private static void reply(Socket socket,boolean accepted) throws IOException {
-        String page="<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>행간</title><body style='padding:48px;background:#f7f5ef;color:#263c30;font-family:sans-serif'><h1>행간</h1><p>"+(accepted?"행간 앱으로 돌아가 주세요.":"로그인 요청을 확인할 수 없어요.")+"</p>";
-        byte[] bytes=page.getBytes(StandardCharsets.UTF_8);
-        OutputStream out=socket.getOutputStream();out.write(("HTTP/1.1 "+(accepted?"200 OK":"400 Bad Request")+"\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: "+bytes.length+"\r\n\r\n").getBytes(StandardCharsets.US_ASCII));out.write(bytes);out.flush();
+    static String safeCode(String code){return code!=null&&code.matches("[a-zA-Z0-9_]{1,80}")?code:"unknown_error";}
+    static String errorKind(Exception error){if(error instanceof javax.net.ssl.SSLException)return "TLS";if(error instanceof UnknownHostException)return "DNS";if(error instanceof SecurityException)return "IDENTITY";if(error instanceof SocketException)return "NETWORK";return "ERROR";}
+    private void ensureSignInActive() throws IOException {if(signInCancelled)throw new IOException(cancelReason);}
+    boolean isSignInPending(){return callback!=null&&!signInCancelled;}
+    String retryAccount(){return retryAccount;}
+    void cancelSignIn(){cancelSignIn("계정 연결을 취소했어요.");}
+    void cancelSignIn(String reason){cancelReason=reason;signInCancelled=true;LoopbackCallback s=callback;if(s!=null)try{s.close();}catch(IOException ignored){}HttpURLConnection c=tokenConnection;if(c!=null)c.disconnect();}
+    private JSONObject signInRequest(String url,byte[] body) throws Exception {
+        ensureSignInActive();
+        HttpURLConnection c=connect(url,body==null?"GET":"POST",null,body==null?null:"application/x-www-form-urlencoded",null);
+        tokenConnection=c;c.setConnectTimeout(8000);c.setReadTimeout(10000);
+        try {
+            ensureSignInActive();
+            if(body!=null){c.setDoOutput(true);c.setRequestProperty("Content-Type","application/x-www-form-urlencoded");try(OutputStream out=c.getOutputStream()){out.write(body);}}
+            int status=c.getResponseCode();
+            if(status<200||status>=300){String code="unknown_error";try{Object e=new JSONObject(readLimited(c.getErrorStream(),100000)).opt("error");code=safeCode(e instanceof JSONObject?((JSONObject)e).optString("code"):String.valueOf(e));}catch(Exception ignored){}throw new IOException("ChatGPT가 연결 요청을 완료하지 못했어요. [HTTP "+status+" / "+code+"]");}
+            return new JSONObject(readLimited(c.getInputStream(),2000000));
+        } finally {c.disconnect();if(tokenConnection==c)tokenConnection=null;}
     }
     private JSONObject mergeTokens(JSONObject record,JSONObject t,JSONObject identity) throws Exception {
         if(identity!=null){record.put("subject",identity.getString("sub"));record.put("email",identity.optString("email"));record.put("label",identity.optString("email", "ChatGPT 계정"));}
