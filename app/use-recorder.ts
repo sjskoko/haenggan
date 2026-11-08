@@ -1,0 +1,19 @@
+"use client";
+import {useState,useEffect,useRef} from "react";
+type Recognition={lang:string;continuous:boolean;interimResults:boolean;onresult:((e:{resultIndex:number;results:{length:number;[i:number]:{isFinal:boolean;[i:number]:{transcript:string}}}})=>void)|null;onerror:(()=>void)|null;onend:(()=>void)|null;start:()=>void;stop:()=>void;abort:()=>void};
+declare global{interface Window{SpeechRecognition?:new()=>Recognition;webkitSpeechRecognition?:new()=>Recognition;}}
+export function useRecorder(onText:(text:string)=>void,serverTranscription:boolean){
+ const [active,setActive]=useState(false),[blob,setBlob]=useState<Blob|null>(null),[url,setUrl]=useState(""),[duration,setDuration]=useState(0),[notice,setNotice]=useState(""),[pending,setPending]=useState("");
+ const recorder=useRef<MediaRecorder|null>(null),stream=useRef<MediaStream|null>(null),speech=useRef<Recognition|null>(null),startTime=useRef(0),running=useRef(false),append=useRef(onText);append.current=onText;
+ function stop(){running.current=false;setActive(false);try{speech.current?.stop();if(recorder.current?.state==="recording")recorder.current.stop();}catch{}stream.current?.getTracks().forEach(t=>t.stop());setPending("");}
+ async function start(){if(blob){setNotice("현재 녹음을 먼저 저장하거나 지워주세요.");return;}setNotice("");if(!navigator.mediaDevices?.getUserMedia||typeof MediaRecorder==="undefined")throw new Error("Chrome에서 열어 녹음하거나 글로 남겨주세요.");
+  try{const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});stream.current=s;const mime=["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(t=>MediaRecorder.isTypeSupported(t));const r=new MediaRecorder(s,mime?{mimeType:mime}:undefined);recorder.current=r;const chunks:BlobPart[]=[];let size=0;
+   r.ondataavailable=e=>{if(e.data.size){chunks.push(e.data);size+=e.data.size;if(size>19000000){stop();setNotice("녹음 크기가 커져 자동으로 마쳤어요. 저장해 주세요.");}}};r.onstop=()=>{const b=new Blob(chunks,{type:r.mimeType||"audio/webm"});if(b.size)setBlob(b);s.getTracks().forEach(t=>t.stop());};r.onerror=()=>{stop();setNotice("녹음이 중단됐어요. 남은 원음을 확인해 주세요.");};r.start(1000);startTime.current=Date.now();setDuration(0);running.current=true;setActive(true);
+   if(!serverTranscription){const S=window.SpeechRecognition||window.webkitSpeechRecognition;if(S){const sr=new S();speech.current=sr;sr.lang="ko-KR";sr.continuous=true;sr.interimResults=true;sr.onresult=e=>{let final="",interim="";for(let i=e.resultIndex;i<e.results.length;i++){if(e.results[i].isFinal)final+=e.results[i][0].transcript+" ";else interim+=e.results[i][0].transcript;}if(final.trim())append.current(final.trim());setPending(interim);};sr.onerror=()=>setNotice("받아쓰기가 멈췄어요. 음성 녹음은 계속되고 있어요.");sr.onend=()=>{setPending("");if(running.current)setNotice("받아쓰기가 종료됐어요. 녹음은 계속되고 있어요.");};try{sr.start();}catch{setNotice("녹음 중이에요. 글은 직접 입력해 주세요.");}}else setNotice("이 브라우저에서는 받아쓰기를 지원하지 않아요. 원음으로 보관할 수 있어요.");}
+  }catch(e){stream.current?.getTracks().forEach(t=>t.stop());throw new Error((e as Error).name==="NotAllowedError"?"마이크 사용을 허용해 주세요. 글로도 남길 수 있어요.":(e as Error).message);}
+ }
+ useEffect(()=>{if(!active)return;const t=setInterval(()=>{const elapsed=Math.floor((Date.now()-startTime.current)/1000);setDuration(elapsed);if(elapsed>=1200){stop();setNotice("20분 녹음을 마쳤어요. 저장해 주세요.");}},500);return()=>clearInterval(t);},[active]);
+ useEffect(()=>{if(!blob){setUrl("");return;}const u=URL.createObjectURL(blob);setUrl(u);return()=>URL.revokeObjectURL(u);},[blob]);
+ useEffect(()=>()=>{running.current=false;try{speech.current?.abort();if(recorder.current?.state==="recording")recorder.current.stop();}catch{}stream.current?.getTracks().forEach(t=>t.stop());},[]);
+ return {active,blob,url,duration,notice,pending,start,stop,clear:()=>{setBlob(null);setDuration(0);setNotice("");}};
+}

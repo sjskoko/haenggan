@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light"><title>행간</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script></head>
+<body><header><button class="brand" id="home" aria-label="행간 오늘"><svg width="21" height="25" viewBox="0 0 21 25" aria-hidden="true"><path d="M1 3h19M1 12h13M1 21h19" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>행간</button><button id="settings" class="icon" aria-label="알림과 계정 설정">⚙</button></header>
+<main id="main" aria-live="polite"><p class="muted">일기장을 열고 있어요</p></main>
+<nav aria-label="일기 메뉴"><button data-tab="today" class="selected">오늘</button><button data-tab="records">기록</button><button data-tab="week">한 주</button></nav>
+<dialog id="sheet"><div class="sheet-top"><h2 id="sheet-title"></h2><button class="icon" id="close-sheet" aria-label="닫기">×</button></div><div id="sheet-body"></div></dialog>
+<div id="toast" role="status" hidden></div><div id="error" role="alert" hidden><p></p><button id="error-usage">ChatGPT 사용량 관리</button><button id="error-close" class="quiet">닫기</button></div>
+</body></html>
