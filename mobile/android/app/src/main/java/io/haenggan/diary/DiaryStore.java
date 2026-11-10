@@ -18,7 +18,7 @@ final class DiaryStore {
     JSONObject state() throws Exception {
         JSONObject root=vault.read(),book=book(root);JSONArray accounts=new JSONArray();JSONObject all=root.optJSONObject("accounts");
         if(all!=null){Iterator<String> keys=all.keys();while(keys.hasNext())accounts.put(ChatGpt.publicAccount(all.getJSONObject(keys.next())));}
-        return new JSONObject().put("activeAccount",key(root)).put("accounts",accounts).put("entries",book.getJSONArray("entries")).put("draft",book.optString("draft")).put("today",today());
+        return new JSONObject().put("activeAccount",key(root)).put("accounts",accounts).put("entries",book.getJSONArray("entries")).put("draft",book.optString("draft")).put("today",today()).put("suggestedDate",LocalDateTime.now(SEOUL).getHour()<4?LocalDate.now(SEOUL).minusDays(1).toString():today());
     }
     JSONObject save(JSONObject input) throws Exception {
         String date=input.getString("date"),text=input.getString("text").trim();LocalDate parsed=LocalDate.parse(date);
@@ -31,11 +31,24 @@ final class DiaryStore {
         else if(input.optInt("revision",-1)!=found.getInt("revision"))throw new IllegalArgumentException("일기가 바뀌었어요. 다시 열어 주세요.");
         String title=input.optString("title").trim();if(title.isEmpty())title=text.substring(0,Math.min(text.length(),36)).replace('\n',' ');
         if(title.length()>80)throw new IllegalArgumentException("제목은 80자까지 남길 수 있어요.");
+        found.remove("refined");
         found.put("date",date).put("text",text).put("title",title).put("summary","").put("revision",found.getInt("revision")+1).put("updatedAt",Instant.now().toString());
         book.put("draft","");vault.write(root);return found;
     }
     JSONObject find(JSONObject root,String id) throws Exception {JSONArray entries=book(root).getJSONArray("entries");for(int i=0;i<entries.length();i++)if(entries.getJSONObject(i).getString("id").equals(id))return entries.getJSONObject(i);throw new IllegalArgumentException("일기를 찾을 수 없어요.");}
     void delete(String id) throws Exception {JSONObject root=vault.read();JSONArray entries=book(root).getJSONArray("entries");for(int i=0;i<entries.length();i++)if(entries.getJSONObject(i).getString("id").equals(id)){entries.remove(i);vault.write(root);return;}throw new IllegalArgumentException("일기를 찾을 수 없어요.");}
+    String refine(String id) throws Exception {
+        JSONObject entry=find(vault.read(),id);
+        return chat.complete(EDITOR+"음성 전사문을 읽기 좋은 일기 본문으로 다듬어라. 요약하지 말고 사건과 구체적인 표현을 보존하라. 말버릇과 불필요한 반복만 정리하고 문장과 문단을 나눠라. 사용자의 1인칭 말투와 감정의 강도를 유지하라. 불확실한 단어를 추측해 고치지 마라. 제목이나 설명 없이 본문만 반환하라.",entry.getString("text"));
+    }
+    JSONObject acceptRefinement(JSONObject input) throws Exception {
+        String value=input.getString("text").trim();
+        if(value.isEmpty()||value.length()>24000)throw new IllegalArgumentException("정제한 글은 1자부터 24000자까지 보관할 수 있어요.");
+        JSONObject root=vault.read(),entry=find(root,input.getString("id"));
+        if(entry.getInt("revision")!=input.getInt("revision"))throw new IllegalArgumentException("일기가 바뀌었어요. 다시 열어 주세요.");
+        entry.put("refined",value).put("revision",entry.getInt("revision")+1).put("updatedAt",Instant.now().toString());
+        vault.write(root);return entry;
+    }
     JSONObject summarize(String id) throws Exception {
         JSONObject root=vault.read(),entry=find(root,id);
         String result=chat.complete(EDITOR+"원문의 말투를 살려 짧은 1인칭 일기로 정리하라. 제목 없이 본문만 반환하라. 원문의 2/3 또는 600자 이내로 줄이고 감정은 사용자가 말한 정도만 표현하라.",entry.getString("text"));
